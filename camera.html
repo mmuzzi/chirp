@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chirp · Camera</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light dark; --fg: #111; --bg: #fafafa; --mute: #888; --line: #ddd; --ok: #1a7f37; --accent: #2563eb; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #111; --line: #333; --ok: #3fb950; --accent: #60a5fa; } }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; font: 16px/1.4 -apple-system, system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 640px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  nav { font-size: 14px; margin-bottom: 16px; }
+  nav a { color: var(--accent); }
+  section { border-top: 1px solid var(--line); padding: 16px 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--mute); margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  button, select, .btn { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .hint { color: var(--mute); font-size: 13px; }
+  .stats { font: 13px ui-monospace, monospace; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin-top: 10px; }
+  .stats span:nth-child(odd) { color: var(--mute); }
+  #preview { position: relative; margin-top: 10px; }
+  #video { width: 100%; border-radius: 8px; background: #000; display: block; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  progress { width: 100%; height: 8px; margin-top: 10px; }
+  #files { list-style: none; padding: 0; margin: 12px 0 0; }
+  #files li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  #files .meta { font-size: 13px; color: var(--mute); }
+  #stage { position: fixed; inset: 0; background: #000; z-index: 10; cursor: none; }
+  #stage canvas { width: 100vw; height: 100vh; display: block; image-rendering: pixelated; }
+  #stageInfo { position: fixed; left: 8px; bottom: 6px; color: #666; font: 12px ui-monospace, monospace; z-index: 11; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Chirp — Camera</h1>
+  <nav><a href="./">Sound</a> · <b>Camera</b></nav>
+
+  <section>
+    <h2>Send (laptop screen)</h2>
+    <div class="row" style="margin-top:0">
+      <label class="btn">File…<input id="file" type="file" hidden></label>
+      <select id="preset"></select>
+      <select id="rate">
+        <option value="60" selected>60 screens/s</option>
+        <option value="30">30 screens/s (longer exposure)</option>
+        <option value="120">120 screens/s (120 fps camera)</option>
+      </select>
+    </div>
+    <div class="row"><button id="start" class="primary" disabled>Start fullscreen</button><span id="sendInfo" class="hint">Pick a file.</span></div>
+  </section>
+
+  <section>
+    <h2>Receive (phone camera)</h2>
+    <div class="row" style="margin-top:0">
+      <button id="cam" class="primary">Start camera</button>
+      <select id="camMode">
+        <option value="1080p60" selected>1080p · 60 fps</option>
+        <option value="720p60">720p · 60 fps</option>
+        <option value="720p120">720p · 120 fps</option>
+      </select>
+    </div>
+    <div id="preview" hidden><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div>
+    <progress id="progress" value="0" max="1" hidden></progress>
+    <div class="stats" id="stats" hidden></div>
+    <ul id="files"></ul>
+  </section>
+
+  <p class="hint">Use Chrome on the laptop (Safari caps animation at 60 Hz) and hold the phone in landscape so the code fills most of the frame.
+    If "codewords ok" stays low, try 30 screens/s or a smaller preset; if it's ~100%, try a bigger one.</p>
+</main>
+
+<div id="stage" hidden><canvas id="stageCanvas"></canvas><div id="stageInfo"></div></div>
+
+<script src="optical.js"></script>
+<script type="module">
+import initRQ, { encode_packets, RaptorQDecoder } from "./vendor/raptorq/raptorqr_raptorq_wasm.js";
+const rqReady = initRQ();
+const $ = (id) => document.getElementById(id);
+const O = window.Optical;
+const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`);
+const fmtDur = (s) => (s < 60 ? `${s.toFixed(1)} s` : `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, "0")}s`);
+
+for (const [k, p] of Object.entries(O.PRESETS)) $("preset").add(new Option(p.label, k));
+$("preset").value = "max";
+
+// ================= Send =================
+let file = null, prep = null;
+function sendEstimate() {
+  if (!prep) return;
+  const key = $("preset").value, rate = Number($("rate").value);
+  const bps = O.bytesPerScreen(key) * rate;
+  $("sendInfo").textContent = `${file.name} · ${fmtBytes(file.bytes.length)}${prep.deflated ? ` → ${fmtBytes(prep.transferLen)} compressed` : ""} · ${(bps * 8 / 1e6).toFixed(1)} Mbps max · ≥ ${fmtDur(prep.transferLen / bps)}`;
+}
+$("file").onchange = async () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  $("sendInfo").textContent = "Encoding…";
+  file = { name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) };
+  await rqReady;
+  prep = await O.prepareSend({ encode_packets }, file, { repairPercent: 100 });
+  $("start").disabled = false;
+  sendEstimate();
+};
+$("preset").onchange = sendEstimate;
+$("rate").onchange = sendEstimate;
+
+let sending = false;
+$("start").onclick = async () => {
+  const key = $("preset").value, rate = Number($("rate").value), L = O.layout(key);
+  const stage = $("stage"), canvas = $("stageCanvas");
+  stage.hidden = false;
+  try { await stage.requestFullscreen?.(); } catch {}
+  await new Promise((r) => setTimeout(r, 300)); // let fullscreen settle
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const tw = L.W + 2 * L.quiet, th = L.H + 2 * L.quiet;
+  const s = Math.floor(Math.min(canvas.width / tw, canvas.height / th));
+  const ox = Math.floor((canvas.width - tw * s) / 2), oy = Math.floor((canvas.height - th * s) / 2);
+  const small = new OffscreenCanvas(L.W, L.H), sctx = small.getContext("2d");
+  const imgData = sctx.createImageData(L.W, L.H), px = new Uint32Array(imgData.data.buffer);
+  const cells = new Uint8Array(L.W * L.H);
+  const BLACK = 0xff000000, WHITE = 0xffffffff;
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#fff"; ctx.fillRect(ox, oy, tw * s, th * s);
+  ctx.imageSmoothingEnabled = false;
+
+  // Measure the display refresh, then hold each screen for round(Hz / rate) refreshes.
+  const stamps = [];
+  await new Promise((done) => { const f = (t) => { stamps.push(t); stamps.length < 40 ? requestAnimationFrame(f) : done(); }; requestAnimationFrame(f); });
+  const deltas = stamps.slice(1).map((t, i) => t - stamps[i]).sort((a, b) => a - b);
+  const hz = 1000 / deltas[deltas.length >> 1];
+  const hold = Math.max(1, Math.round(hz / rate));
+  const screensPerSec = hz / hold;
+  $("stageInfo").textContent = `${L.W}×${L.H} · ${s}px/cell · display ${hz.toFixed(0)} Hz · ${screensPerSec.toFixed(0)} screens/s · ${(O.bytesPerScreen(key) * screensPerSec * 8 / 1e6).toFixed(1)} Mbps · Esc to stop`;
+
+  sending = true;
+  let refresh = 0, n = 0;
+  const draw = () => {
+    if (!sending) return;
+    if (refresh % hold === 0) {
+      O.renderScreen(prep, key, n++, cells);
+      for (let i = 0; i < cells.length; i++) px[i] = cells[i] ? BLACK : WHITE;
+      sctx.putImageData(imgData, 0, 0);
+      ctx.drawImage(small, ox + L.quiet * s, oy + L.quiet * s, L.W * s, L.H * s);
+    }
+    refresh++;
+    requestAnimationFrame(draw);
+  };
+  requestAnimationFrame(draw);
+};
+const stopSending = () => { sending = false; $("stage").hidden = true; if (document.fullscreenElement) document.exitFullscreen(); };
+document.addEventListener("keydown", (e) => e.key === "Escape" && stopSending());
+document.addEventListener("fullscreenchange", () => !document.fullscreenElement && sending && stopSending());
+$("stage").onclick = stopSending;
+
+// ================= Receive =================
+const VS = `attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
+const LUM = `float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }`;
+// Image coords: gl_FragCoord rows map 1:1 to readPixels rows, and texture v=0 is the top video row.
+const FS_LOW = `precision highp float; uniform sampler2D v; uniform vec2 size; uniform float ds; ${LUM}
+  void main() { vec2 base = (floor(gl_FragCoord.xy) * ds); float s = 0.0;
+    for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) s += lum(texture2D(v, (base + (vec2(float(i), float(j)) + 0.5) * ds / 4.0) / size).rgb);
+    gl_FragColor = vec4(s / 16.0, 0.0, 0.0, 1.0); }`;
+const FS_FULL = `precision highp float; uniform sampler2D v; uniform vec2 size; ${LUM}
+  void main() { gl_FragColor = vec4(lum(texture2D(v, gl_FragCoord.xy / size).rgb), 0.0, 0.0, 1.0); }`;
+const FS_CELLS = `precision highp float; uniform sampler2D v; uniform vec2 size; uniform mat3 H; uniform float q[20]; uniform vec2 grid; ${LUM}
+  vec2 warp(vec2 uv) { vec3 h = H * vec3(uv, 1.0); vec2 p = h.xy / h.z; float a = uv.x / grid.x - 0.5, b = uv.y / grid.y - 0.5;
+    float f[10]; f[0]=1.0; f[1]=a; f[2]=b; f[3]=a*a; f[4]=a*b; f[5]=b*b; f[6]=a*a*a; f[7]=a*a*b; f[8]=a*b*b; f[9]=b*b*b;
+    for (int i = 0; i < 10; i++) { p.x += q[i] * f[i]; p.y += q[10 + i] * f[i]; } return p; }
+  float tap(vec2 uv) { return lum(texture2D(v, warp(uv) / size).rgb); }
+  void main() { vec2 c = floor(gl_FragCoord.xy);
+    float s = tap(c + vec2(0.5)) + tap(c + vec2(0.3, 0.3)) + tap(c + vec2(0.7, 0.3)) + tap(c + vec2(0.3, 0.7)) + tap(c + vec2(0.7, 0.7));
+    gl_FragColor = vec4(s / 5.0, 0.0, 0.0, 1.0); }`;
+
+class GLSampler {
+  constructor() {
+    const c = document.createElement("canvas");
+    const gl = (this.gl = c.getContext("webgl", { preserveDrawingBuffer: false, antialias: false }));
+    if (!gl) throw new Error("WebGL unavailable");
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const prog = (fs) => {
+      const p = gl.createProgram();
+      for (const [type, src] of [[gl.VERTEX_SHADER, VS], [gl.FRAGMENT_SHADER, fs]]) {
+        const sh = gl.createShader(type);
+        gl.shaderSource(sh, src);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+        gl.attachShader(p, sh);
+      }
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+      return p;
+    };
+    this.pLow = prog(FS_LOW); this.pFull = prog(FS_FULL); this.pCells = prog(FS_CELLS);
+    this.tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+    this.fbos = new Map();
+  }
+  fbo(name, w, h) {
+    const gl = this.gl;
+    let f = this.fbos.get(name);
+    if (f && f.w === w && f.h === h) return f;
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    f = { fb, w, h, rgba: new Uint8Array(w * h * 4) };
+    this.fbos.set(name, f);
+    return f;
+  }
+  run(p, f, uniforms) {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f.fb);
+    gl.viewport(0, 0, f.w, f.h);
+    gl.useProgram(p);
+    const loc = gl.getAttribLocation(p, "p");
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.uniform1i(gl.getUniformLocation(p, "v"), 0);
+    gl.uniform2f(gl.getUniformLocation(p, "size"), this.vw, this.vh);
+    uniforms?.(gl, (n) => gl.getUniformLocation(p, n));
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  read(f, x = 0, y = 0, w = f.w, h = f.h) {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f.fb);
+    const rgba = w * h * 4 === f.rgba.length ? f.rgba : new Uint8Array(w * h * 4);
+    gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    const out = new Uint8Array(w * h);
+    for (let i = 0; i < out.length; i++) out[i] = rgba[i * 4];
+    return out;
+  }
+  upload(video) {
+    const gl = this.gl;
+    this.vw = video.videoWidth; this.vh = video.videoHeight;
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  }
+  low(ds) {
+    const f = this.fbo("low", Math.floor(this.vw / ds), Math.floor(this.vh / ds));
+    this.run(this.pLow, f, (gl, u) => gl.uniform1f(u("ds"), ds));
+    return { w: f.w, h: f.h, data: this.read(f) };
+  }
+  full() {
+    this.fullF = this.fbo("full", this.vw, this.vh);
+    this.run(this.pFull, this.fullF);
+  }
+  patch(x0, y0, w, h) {
+    if (x0 < 0 || y0 < 0 || x0 + w > this.vw || y0 + h > this.vh) return null;
+    return this.read(this.fullF, x0, y0, w, h);
+  }
+  cells(L, warp) {
+    const f = this.fbo("cells:" + L.key, L.W, L.H);
+    this.run(this.pCells, f, (gl, u) => {
+      const Hm = warp.H; // row-major -> column-major for GLSL
+      gl.uniformMatrix3fv(u("H"), false, [Hm[0], Hm[3], Hm[6], Hm[1], Hm[4], Hm[7], Hm[2], Hm[5], Hm[8]]);
+      gl.uniform1fv(u("q"), new Float32Array(warp.q));
+      gl.uniform2f(u("grid"), L.W, L.H);
+    });
+    return this.read(f);
+  }
+}
+
+let stream = null, running = false;
+const S = { frames: 0, locked: 0, ok: 0, bad: 0, t0: 0, lastTs: 0, fpsEMA: 0, procEMA: 0, pxPerCell: 0, preset: null, reason: "", unique: 0, needed: 0, name: "", fileLen: 0, startedAt: 0 };
+let assembler = null;
+
+function statsRow(k, v) { return `<span>${k}</span><span>${v}</span>`; }
+function renderStats() {
+  const v = $("video");
+  const elapsed = S.startedAt ? (Date.now() - S.startedAt) / 1000 : 0;
+  const rate = elapsed > 0 ? (S.unique * (O.RQ_PACKET - 4) * 8) / elapsed / 1e6 : 0;
+  $("stats").innerHTML =
+    statsRow("camera", `${v.videoWidth}×${v.videoHeight} · ${S.fpsEMA.toFixed(0)} fps · ${S.procEMA.toFixed(1)} ms/frame`) +
+    statsRow("lock", S.preset ? `${O.PRESETS[S.preset].label} · ${S.pxPerCell.toFixed(2)} px/cell · ${((100 * S.locked) / Math.max(1, S.frames)).toFixed(0)}% frames` : S.reason || "searching…") +
+    statsRow("codewords ok", `${((100 * S.ok) / Math.max(1, S.ok + S.bad)).toFixed(1)}% (${S.ok}/${S.ok + S.bad})`) +
+    statsRow("file", S.name ? `${S.name} · ${fmtBytes(S.fileLen)}` : "—") +
+    statsRow("packets", S.needed ? `${S.unique}/${S.needed} · ${rate.toFixed(2)} Mbps${rate > 0 && S.unique < S.needed ? ` · ~${fmtDur(((S.needed - S.unique) * (O.RQ_PACKET - 4) * 8) / (rate * 1e6))} left` : ""}` : "—");
+  $("progress").hidden = !S.needed;
+  $("progress").max = S.needed || 1;
+  $("progress").value = S.unique;
+}
+
+function drawOverlay(warp) {
+  const c = $("overlay"), v = $("video");
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  const ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (!warp) return;
+  ctx.strokeStyle = "#22c55e"; ctx.lineWidth = Math.max(2, c.width / 400);
+  const L = O.layout(S.preset);
+  ctx.beginPath();
+  for (const [u, v2] of [[0, 0], [L.W, 0], [L.W, L.H], [0, L.H], [0, 0]]) ctx.lineTo(...O.warpPoint(warp, u, v2));
+  ctx.stroke();
+}
+
+const DS = 4;
+function processFrame(gls) {
+  const t = performance.now();
+  gls.upload($("video"));
+  const low = gls.low(DS);
+  gls.full();
+  const cands = O.findBlobs(low);
+  const order = [S.preset, ...Object.keys(O.PRESETS)].filter((k, i, a) => k && a.indexOf(k) === i);
+  let locked = null;
+  for (const key of order) {
+    const L = O.layout(key);
+    const loc = O.locate(low, DS, (x0, y0, w, h) => gls.patch(x0, y0, w, h), L, cands);
+    if (!loc.warp) { S.reason = loc.reason; if (key === order[0] && /landscape|markers/.test(loc.reason)) break; continue; }
+    const r = O.decodeCells(L, gls.cells(L, loc.warp));
+    if (r.ok === 0 && order.length > 1 && key !== order[order.length - 1]) continue; // probably the wrong preset
+    locked = loc.warp;
+    S.preset = key; S.pxPerCell = loc.warp.pxPerCell;
+    S.ok += r.ok; S.bad += r.bad;
+    for (const p of r.packets) assembler.push(p);
+    break;
+  }
+  S.frames++;
+  if (locked) S.locked++;
+  if (S.frames % 3 === 0) drawOverlay(locked);
+  S.procEMA = S.procEMA ? S.procEMA * 0.9 + (performance.now() - t) * 0.1 : performance.now() - t;
+}
+
+function addFile({ name, bytes, seconds }) {
+  const li = document.createElement("li");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([bytes]));
+  a.download = name;
+  a.textContent = `Download ${name}`;
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = `${fmtBytes(bytes.length)} · ${seconds.toFixed(1)} s · ${((bytes.length * 8) / seconds / 1e6).toFixed(2)} Mbps · checksum verified`;
+  li.append(a, meta);
+  $("files").prepend(li);
+  navigator.vibrate?.(100);
+}
+
+const CAM = {
+  "1080p60": { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } },
+  "720p60": { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+  "720p120": { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 120 } },
+};
+
+$("cam").onclick = async () => {
+  if (stream) {
+    running = false;
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    $("cam").textContent = "Start camera";
+    return;
+  }
+  try {
+    await rqReady;
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, ...CAM[$("camMode").value] } });
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities?.() || {};
+    if (caps.focusMode?.includes("continuous")) track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(() => {});
+  } catch (e) { $("stats").hidden = false; $("stats").textContent = `Camera error: ${e.message}`; return; }
+  const v = $("video");
+  v.srcObject = stream;
+  await v.play();
+  $("preview").hidden = false; $("stats").hidden = false;
+  $("cam").textContent = "Stop camera";
+  Object.assign(S, { frames: 0, locked: 0, ok: 0, bad: 0, unique: 0, needed: 0, name: "", startedAt: 0, preset: null });
+  assembler = new O.Assembler({ RaptorQDecoder }, {
+    onProgress: (p) => Object.assign(S, { unique: p.unique, needed: p.needed, name: p.name, fileLen: p.fileLen, startedAt: S.startedAt || p.startedAt }),
+    onDone: (r) => { addFile(r); Object.assign(S, { unique: 0, needed: 0, name: "", startedAt: 0 }); },
+    onError: (e) => (S.reason = e.message),
+  });
+  const gls = new GLSampler();
+  running = true;
+  const tick = (now, meta) => {
+    if (!running) return;
+    if (S.lastTs) { const dt = (meta?.mediaTime ?? now / 1000) - S.lastTs; if (dt > 0) S.fpsEMA = S.fpsEMA ? S.fpsEMA * 0.9 + (1 / dt) * 0.1 : 1 / dt; }
+    S.lastTs = meta?.mediaTime ?? now / 1000;
+    try { processFrame(gls); } catch (e) { S.reason = e.message; console.error(e); }
+    v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+  };
+  v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+  const statsTimer = setInterval(() => (running ? renderStats() : clearInterval(statsTimer)), 250);
+};
+
+window.__chirpCamera = { S }; // for automated tests
+</script>
+</body>
+</html>
