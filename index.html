@@ -68,7 +68,7 @@
 
   <p class="hint">Turbo is ~3.5× faster but wants the devices close (≤30 cm) and a quiet room; fall back to Fast or Robust if it doesn't land.
     Long text and files are compressed and split into chunks — use Loop and the receiver fills in any chunk it missed. Receiver auto-detects the speed.
-    Rough capacity in 3 minutes: ~7 KB on Turbo, ~2 KB on Fast (more if the file compresses well).</p>
+    Rough capacity in 3 minutes: ~7 KB on Turbo, ~2 KB on Fast (more if the file compresses well). A 600 KB file is roughly 4–5 hours on Turbo.</p>
 </main>
 
 <script src="modem.js"></script>
@@ -76,6 +76,9 @@
 const $ = (id) => document.getElementById(id);
 let ctx;
 const audio = () => (ctx ??= new AudioContext());
+// iOS: Web Audio follows the ring/silent switch and, while the mic is open, the quiet earpiece.
+// Safari's audioSession API lets us ask for real media playback (loudspeaker, ignores silent switch).
+const setSession = (type) => { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; };
 
 for (const [key, m] of Object.entries(Modem.MODES)) $("speed").add(new Option(m.label, key));
 $("speed").value = "turbo";
@@ -199,6 +202,7 @@ function stopSending() {
 }
 
 $("play").onclick = async () => {
+  if (!stream) setSession("playback");
   audio().resume(); // inside the tap, before any await, so iOS lets audio start
   stopSending();
   try {
@@ -210,6 +214,7 @@ $("play").onclick = async () => {
 };
 $("loop").onclick = async () => {
   if (looping) return stopSending();
+  if (!stream) setSession("playback");
   audio().resume();
   stopSending();
   try {
@@ -260,6 +265,8 @@ const receiver = new Modem.Receiver({
 
 $("listen").onclick = async () => {
   if (stream) return stopListening();
+  stopSending();
+  setSession("play-and-record");
   const ac = audio();
   try {
     await ac.resume();
@@ -299,6 +306,7 @@ function stopListening() {
   worker.terminate();
   cancelAnimationFrame(raf);
   stream = proc = analyser = worker = null;
+  setSession("auto");
   $("listen").textContent = "Listen";
   $("rxStatus").textContent = "Mic off";
 }

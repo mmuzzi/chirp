@@ -1,7 +1,7 @@
 // Tiny acoustic modem: 17-tone differential MFSK, 4 bits per tone, 1 or more parallel channels.
 //
 // Frame (all fields are nibbles after the preamble):
-//   preamble (8 symbols) | head (1) | [id (3) | idx (3) | total (3)] | len (2) | payload (len) | CRC-16 (4)
+//   preamble (8 symbols) | head (1) | [id (3) | idx (4) | total (4)] | len (2) | payload (len) | CRC-16 (4)
 //   head bits 0-1 = type (0 UTF-8, 1 lowercase hex, 2 deflate-raw UTF-8, 3 file), bit 2 = multi-frame (bracketed fields present).
 // File payload bytes: flags (1, bit 0 = deflated) | name length (1) | name (UTF-8) | CRC-32 of the file (4) | data.
 // Each nibble n is sent as tone (prev + 1 + n) % 17, so consecutive tones on a channel always differ and the
@@ -12,7 +12,7 @@
   const PREAMBLE = [0, 16, 0, 16, 3, 13, 6, 10];
   const HOPS_PER_SYMBOL = 6;
   const CHUNK_NIBBLES = 192;
-  const MAX_CHUNKS = 4095;
+  const MAX_CHUNKS = 65535;
   const REPAIR_SLOTS = 8; // 8 singles + 28 pairs: ~36 extra CRC checks, ~1 in 1800 chance of a false accept per damaged frame
 
   const MODES = {
@@ -105,7 +105,7 @@
     if (total > MAX_CHUNKS) throw new Error(`Too large: ${total} chunks (max ${MAX_CHUNKS}, ~${Math.floor((MAX_CHUNKS * CHUNK_NIBBLES) / 2048)} KB after compression)`);
     return Array.from({ length: total }, (_, idx) => {
       const chunk = nibbles.slice(idx * CHUNK_NIBBLES, (idx + 1) * CHUNK_NIBBLES);
-      const body = [type | 4, ...toNibbles(id, 3), ...toNibbles(idx, 3), ...toNibbles(total, 3), ...toNibbles(chunk.length, 2), ...chunk];
+      const body = [type | 4, ...toNibbles(id, 3), ...toNibbles(idx, 4), ...toNibbles(total, 4), ...toNibbles(chunk.length, 2), ...chunk];
       return [...body, ...toNibbles(crc16(body), 4)];
     });
   }
@@ -268,11 +268,11 @@
       const head = this.readNibbles(start, 1, flips).nibbles[0];
       if (head > 7) return null;
       const multi = (head & 4) !== 0;
-      const hdrLen = multi ? 12 : 3;
+      const hdrLen = multi ? 14 : 3;
       if (!have(hdrLen)) return "wait";
       const hdr = this.readNibbles(start, hdrLen, flips).nibbles;
       const len = fromNibbles(hdr.slice(hdrLen - 2));
-      if (len === 0 || (multi && fromNibbles(hdr.slice(4, 7)) >= fromNibbles(hdr.slice(7, 10)))) return null;
+      if (len === 0 || (multi && fromNibbles(hdr.slice(4, 8)) >= fromNibbles(hdr.slice(8, 12)))) return null;
       const total = hdrLen + len + 4;
       if (!have(total)) return "wait";
       const { nibbles: all, doubt } = this.readNibbles(start, total, flips);
@@ -285,8 +285,8 @@
           type: head & 3,
           multi,
           id: multi ? fromNibbles(hdr.slice(1, 4)) : null,
-          idx: multi ? fromNibbles(hdr.slice(4, 7)) : 0,
-          total: multi ? fromNibbles(hdr.slice(7, 10)) : 1,
+          idx: multi ? fromNibbles(hdr.slice(4, 8)) : 0,
+          total: multi ? fromNibbles(hdr.slice(8, 12)) : 1,
           nibbles: body.slice(hdrLen),
           mode: this.modeName,
         },
