@@ -47,7 +47,7 @@ function channel(x, sr, { snr, echo, drift, delay }) {
 function listen(audio, sr) {
   return new Promise((resolve) => {
     const got = [], errors = [], modes = new Set();
-    const rx = new M.Receiver({ onMessage: (m) => got.push(m.text), onError: (e) => errors.push(e.message) });
+    const rx = new M.Receiver({ onMessage: (m) => got.push(m.text ?? m.file), onError: (e) => errors.push(e.message) });
     const decoders = Object.keys(M.MODES).map((m) => new M.Decoder(sr, m, (f) => { modes.add(f.mode); rx.push(f); }));
     for (let i = 0; i < audio.length; i += 4096) for (const d of decoders) d.push(audio.subarray(i, i + 4096));
     setTimeout(() => resolve({ got, errors, modes: [...modes] }), 20); // let async decompression settle
@@ -85,6 +85,19 @@ const concat = (parts) => {
     const audio = channel(concat([M.synthesize(first, sr, mode), new Float32Array(sr * 0.6), M.synthesize(frames, sr, mode)]), sr, CONDITIONS.room);
     const { got } = await listen(audio, sr);
     console.log(`lost chunk + resend (${mode}, ${frames.length} frames): ${got.length === 1 && got[0] === LONG ? "OK" : "FAIL " + got.length}`);
+  }
+
+  // Files: random binary (incompressible) and a text file (compressible), round-tripped byte for byte.
+  {
+    const bin = Uint8Array.from({ length: 1500 }, () => (Math.random() * 256) | 0);
+    const txt = new TextEncoder().encode(LONG + "\n" + PARAGRAPH.repeat(3));
+    for (const mode of ["turbo", "fast"]) for (const [name, bytes] of [["photo.bin", bin], ["notes – café.txt", txt]]) {
+      const sr = 48000, frames = await M.encode({ name, bytes }, mode);
+      const { got } = await listen(channel(M.synthesize(frames, sr, mode), sr, CONDITIONS.room), sr);
+      const f = got[0];
+      const ok = got.length === 1 && f.name === name && f.bytes.length === bytes.length && f.bytes.every((v, i) => v === bytes[i]);
+      console.log(`file ${mode} ${name} ${bytes.length} B → ${frames.length} chunks, ${M.duration(frames, mode).toFixed(1)}s: ${ok ? "OK" : "FAIL"}`);
+    }
   }
 
   // False positives: 60s of noise plus random tone bursts must decode nothing.

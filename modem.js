@@ -1,8 +1,9 @@
 // Tiny acoustic modem: 17-tone differential MFSK, 4 bits per tone, 1 or more parallel channels.
 //
 // Frame (all fields are nibbles after the preamble):
-//   preamble (8 symbols) | head (1) | [id (3) | idx (2) | total (2)] | len (2) | payload (len) | CRC-16 (4)
-//   head bits 0-1 = type (0 UTF-8, 1 lowercase hex, 2 deflate-raw UTF-8), bit 2 = multi-frame (bracketed fields present).
+//   preamble (8 symbols) | head (1) | [id (3) | idx (3) | total (3)] | len (2) | payload (len) | CRC-16 (4)
+//   head bits 0-1 = type (0 UTF-8, 1 lowercase hex, 2 deflate-raw UTF-8, 3 file), bit 2 = multi-frame (bracketed fields present).
+// File payload bytes: flags (1, bit 0 = deflated) | name length (1) | name (UTF-8) | CRC-32 of the file (4) | data.
 // Each nibble n is sent as tone (prev + 1 + n) % 17, so consecutive tones on a channel always differ and the
 // decoder can ignore the previous tone, which is what room echo smears into the current symbol.
 // With C channels, symbol t carries nibbles tC..tC+C-1 on C interleaved tone sets played simultaneously.
@@ -11,7 +12,7 @@
   const PREAMBLE = [0, 16, 0, 16, 3, 13, 6, 10];
   const HOPS_PER_SYMBOL = 6;
   const CHUNK_NIBBLES = 192;
-  const MAX_BYTES = 8000;
+  const MAX_CHUNKS = 4095;
   const REPAIR_SLOTS = 8; // 8 singles + 28 pairs: ~36 extra CRC checks, ~1 in 1800 chance of a false accept per damaged frame
 
   const MODES = {
@@ -38,6 +39,16 @@
   const bytesToNibbles = (bytes) => [...bytes].flatMap((b) => toNibbles(b, 2));
   const nibblesToBytes = (ns) => Uint8Array.from({ length: ns.length >> 1 }, (_, i) => (ns[2 * i] << 4) | ns[2 * i + 1]);
 
+  const CRC32_TABLE = Array.from({ length: 256 }, (_, n) => {
+    for (let k = 0; k < 8; k++) n = n & 1 ? 0xedb88320 ^ (n >>> 1) : n >>> 1;
+    return n >>> 0;
+  });
+  function crc32(bytes) {
+    let c = 0xffffffff;
+    for (const b of bytes) c = CRC32_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
   async function pipe(bytes, stream) {
     const out = await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer();
     return new Uint8Array(out);
@@ -47,17 +58,40 @@
   async function packMessage(text) {
     if (/^[0-9a-f]+$/.test(text)) return { type: 1, nibbles: [...text].map((c) => parseInt(c, 16)) };
     const raw = new TextEncoder().encode(text);
-    if (raw.length > MAX_BYTES) throw new Error(`Too long: ${raw.length} bytes (max ${MAX_BYTES})`);
     const deflated = raw.length > 24 ? await pipe(raw, new CompressionStream("deflate-raw")) : null;
     return deflated && deflated.length < raw.length
       ? { type: 2, nibbles: bytesToNibbles(deflated) }
       : { type: 0, nibbles: bytesToNibbles(raw) };
   }
 
+  async function packFile(name, data) {
+    const deflated = await pipe(data, new CompressionStream("deflate-raw"));
+    const useDeflate = deflated.length < data.length;
+    let nameBytes = new TextEncoder().encode(name);
+    while (nameBytes.length > 255) nameBytes = new TextEncoder().encode((name = name.slice(0, -1)));
+    const crc = crc32(data);
+    const body = useDeflate ? deflated : data;
+    const out = new Uint8Array(2 + nameBytes.length + 4 + body.length);
+    out.set([useDeflate ? 1 : 0, nameBytes.length]);
+    out.set(nameBytes, 2);
+    out.set([crc >>> 24, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff], 2 + nameBytes.length);
+    out.set(body, 6 + nameBytes.length);
+    return { type: 3, nibbles: bytesToNibbles(out) };
+  }
+
+  // -> { text } or { file: { name, bytes } }
   async function unpackMessage(type, nibbles) {
-    if (type === 1) return nibbles.map((n) => n.toString(16)).join("");
+    if (type === 1) return { text: nibbles.map((n) => n.toString(16)).join("") };
     const bytes = nibblesToBytes(nibbles);
-    return new TextDecoder("utf-8", { fatal: true }).decode(type === 2 ? await pipe(bytes, new DecompressionStream("deflate-raw")) : bytes);
+    if (type !== 3)
+      return { text: new TextDecoder("utf-8", { fatal: true }).decode(type === 2 ? await pipe(bytes, new DecompressionStream("deflate-raw")) : bytes) };
+    const nameLen = bytes[1];
+    const name = new TextDecoder().decode(bytes.subarray(2, 2 + nameLen));
+    const crc = ((bytes[2 + nameLen] << 24) | (bytes[3 + nameLen] << 16) | (bytes[4 + nameLen] << 8) | bytes[5 + nameLen]) >>> 0;
+    const body = bytes.subarray(6 + nameLen);
+    const data = bytes[0] & 1 ? await pipe(body, new DecompressionStream("deflate-raw")) : body;
+    if (crc32(data) !== crc) throw new Error(`File "${name}" failed its checksum; listening for a resend`);
+    return { file: { name, bytes: data } };
   }
 
   // Message -> list of frames, each a list of nibbles (without preamble).
@@ -68,10 +102,10 @@
     }
     const id = crc16(nibbles) & 0xfff;
     const total = Math.ceil(nibbles.length / CHUNK_NIBBLES);
-    if (total > 255) throw new Error("Message too long");
+    if (total > MAX_CHUNKS) throw new Error(`Too large: ${total} chunks (max ${MAX_CHUNKS}, ~${Math.floor((MAX_CHUNKS * CHUNK_NIBBLES) / 2048)} KB after compression)`);
     return Array.from({ length: total }, (_, idx) => {
       const chunk = nibbles.slice(idx * CHUNK_NIBBLES, (idx + 1) * CHUNK_NIBBLES);
-      const body = [type | 4, ...toNibbles(id, 3), ...toNibbles(idx, 2), ...toNibbles(total, 2), ...toNibbles(chunk.length, 2), ...chunk];
+      const body = [type | 4, ...toNibbles(id, 3), ...toNibbles(idx, 3), ...toNibbles(total, 3), ...toNibbles(chunk.length, 2), ...chunk];
       return [...body, ...toNibbles(crc16(body), 4)];
     });
   }
@@ -87,9 +121,11 @@
     return syms;
   }
 
-  async function encode(text, modeName) {
+  // input: a string, or { name, bytes } for a file.
+  async function encode(input, modeName) {
     const mode = MODES[modeName];
-    return frameMessage(await packMessage(text)).map((f) => frameSymbols(f, mode));
+    const packed = typeof input === "string" ? await packMessage(input) : await packFile(input.name, input.bytes);
+    return frameMessage(packed).map((f) => frameSymbols(f, mode));
   }
 
   const GAP_SEC = 0.05;
@@ -230,13 +266,13 @@
       const have = (n) => start + (Math.ceil(n / this.C) - 1) * HOPS_PER_SYMBOL < this.framesStart + this.frames.length;
       if (!have(1)) return "wait";
       const head = this.readNibbles(start, 1, flips).nibbles[0];
-      if (head > 6 || (head & 3) === 3) return null;
+      if (head > 7) return null;
       const multi = (head & 4) !== 0;
-      const hdrLen = multi ? 10 : 3;
+      const hdrLen = multi ? 12 : 3;
       if (!have(hdrLen)) return "wait";
       const hdr = this.readNibbles(start, hdrLen, flips).nibbles;
       const len = fromNibbles(hdr.slice(hdrLen - 2));
-      if (len === 0 || (multi && fromNibbles(hdr.slice(4, 6)) >= fromNibbles(hdr.slice(6, 8)))) return null;
+      if (len === 0 || (multi && fromNibbles(hdr.slice(4, 7)) >= fromNibbles(hdr.slice(7, 10)))) return null;
       const total = hdrLen + len + 4;
       if (!have(total)) return "wait";
       const { nibbles: all, doubt } = this.readNibbles(start, total, flips);
@@ -249,8 +285,8 @@
           type: head & 3,
           multi,
           id: multi ? fromNibbles(hdr.slice(1, 4)) : null,
-          idx: multi ? fromNibbles(hdr.slice(4, 6)) : 0,
-          total: multi ? fromNibbles(hdr.slice(6, 8)) : 1,
+          idx: multi ? fromNibbles(hdr.slice(4, 7)) : 0,
+          total: multi ? fromNibbles(hdr.slice(7, 10)) : 1,
           nibbles: body.slice(hdrLen),
           mode: this.modeName,
         },
@@ -313,7 +349,7 @@
   }
 
   // Collects frames from any decoder and reassembles multi-frame messages.
-  // onProgress({ key, got, total }) while assembling; onMessage({ key, text }) when a message completes.
+  // onProgress({ key, got, total }) while assembling; onMessage({ key, text } or { key, file }) when a message completes.
   class Receiver {
     constructor({ onMessage, onProgress, onError }) {
       this.partial = new Map();
@@ -341,11 +377,17 @@
     }
 
     finish(key, type, nibbles) {
-      unpackMessage(type, nibbles).then((text) => this.onMessage({ key, text }), (e) => this.onError(e));
+      unpackMessage(type, nibbles).then(
+        (m) => this.onMessage({ key, ...m }),
+        (e) => {
+          this.partial.delete(key); // start over so the next pass can rebuild it
+          this.onError(e);
+        },
+      );
     }
   }
 
-  const api = { MODES, tonesOf, crc16, packMessage, unpackMessage, encode, duration, synthesize, Decoder, Receiver };
+  const api = { MODES, tonesOf, crc16, crc32, packMessage, unpackMessage, encode, duration, synthesize, Decoder, Receiver };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.Modem = api;
 })(typeof self !== "undefined" ? self : this);

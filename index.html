@@ -9,6 +9,7 @@
   :root { color-scheme: light dark; --fg: #111; --bg: #fafafa; --mute: #888; --line: #ddd; --ok: #1a7f37; --accent: #2563eb; }
   @media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #111; --line: #333; --ok: #3fb950; --accent: #60a5fa; } }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; font: 16px/1.4 -apple-system, system-ui, sans-serif; color: var(--fg); background: var(--bg); }
   main { max-width: 560px; margin: 0 auto; padding: 20px 16px 60px; }
   h1 { font-size: 20px; margin: 0 0 16px; }
@@ -16,7 +17,13 @@
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--mute); margin: 0 0 10px; }
   textarea { width: 100%; min-height: 64px; resize: vertical; font: 15px ui-monospace, monospace; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; }
   .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
-  button, select { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; }
+  button, select, .btn { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; }
+  .btn { cursor: pointer; }
+  .chip { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font: 14px ui-monospace, monospace; word-break: break-all; }
+  .chip span { flex: 1; }
+  .chip button { padding: 0 8px; border: none; }
+  .warn { color: #c2410c; }
+  #sendProgress { margin-top: 10px; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .hint { color: var(--mute); font-size: 13px; }
   #bars { display: flex; gap: 2px; height: 40px; align-items: flex-end; margin-top: 12px; }
@@ -38,12 +45,15 @@
   <section>
     <h2>Send</h2>
     <textarea id="msg" placeholder="gist id, URL, a paragraph…" autocomplete="off" spellcheck="false"></textarea>
+    <div id="fileChip" class="chip" hidden><span id="fileName"></span><button id="fileClear" title="Remove file">✕</button></div>
     <div class="row">
       <button id="play" class="primary">Play</button>
       <button id="loop">Loop</button>
       <select id="speed"></select>
+      <label class="btn">File…<input id="file" type="file" hidden></label>
       <span id="sendInfo" class="hint"></span>
     </div>
+    <progress id="sendProgress" hidden></progress>
   </section>
 
   <section>
@@ -57,7 +67,8 @@
   </section>
 
   <p class="hint">Turbo is ~3.5× faster but wants the devices close (≤30 cm) and a quiet room; fall back to Fast or Robust if it doesn't land.
-    Long text is compressed and split into chunks — use Loop and the receiver fills in any chunk it missed. Receiver auto-detects the speed.</p>
+    Long text and files are compressed and split into chunks — use Loop and the receiver fills in any chunk it missed. Receiver auto-detects the speed.
+    Rough capacity in 3 minutes: ~7 KB on Turbo, ~2 KB on Fast (more if the file compresses well).</p>
 </main>
 
 <script src="modem.js"></script>
@@ -70,58 +81,148 @@ for (const [key, m] of Object.entries(Modem.MODES)) $("speed").add(new Option(m.
 $("speed").value = "turbo";
 
 // ---------- Send ----------
-let looping = false, current = null, encoded = null; // encoded: { text, mode, frames }
+const WARN_SECONDS = 180;
+let file = null; // { name, bytes } when a file is attached; takes priority over the text box
+let encoded = null; // { input, mode, frames }
+let sending = null; // { stop() } for the transmission in progress
+let looping = false;
+
+const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`);
+const fmtDur = (s) => (s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, "0")}s`);
 
 async function getFrames() {
-  const text = $("msg").value.trim(), mode = $("speed").value;
-  if (!text) return null;
-  if (encoded?.text !== text || encoded?.mode !== mode) encoded = { text, mode, frames: await Modem.encode(text, mode) };
+  const input = file ?? $("msg").value.trim(), mode = $("speed").value;
+  if (!input) return null;
+  if (encoded?.input !== input || encoded?.mode !== mode) encoded = { input, mode, frames: await Modem.encode(input, mode) };
   return encoded;
 }
 
 async function updateInfo() {
+  const info = $("sendInfo");
+  info.className = "hint";
   try {
     const e = await getFrames();
-    $("sendInfo").textContent = e ? `${Modem.duration(e.frames, e.mode).toFixed(1)}s${e.frames.length > 1 ? ` · ${e.frames.length} chunks` : ""}` : "";
-  } catch (err) { $("sendInfo").textContent = err.message; }
+    if (!e) return (info.textContent = "");
+    const secs = Modem.duration(e.frames, e.mode);
+    info.textContent = `${fmtDur(secs)}${e.frames.length > 1 ? ` · ${e.frames.length} chunks` : ""}${secs > WARN_SECONDS ? " · over 3 min" : ""}`;
+    if (secs > WARN_SECONDS) info.className = "hint warn";
+  } catch (err) {
+    info.textContent = err.message;
+    info.className = "hint warn";
+  }
 }
 $("msg").addEventListener("input", updateInfo);
 $("speed").addEventListener("change", updateInfo);
 
-async function playOnce() {
+$("file").onchange = async () => {
+  const f = $("file").files[0];
+  $("file").value = "";
+  if (!f) return;
+  file = { name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) };
+  $("fileName").textContent = `${f.name} · ${fmtBytes(f.size)}`;
+  $("fileChip").hidden = false;
+  $("msg").hidden = true;
+  $("sendInfo").textContent = "Encoding…";
+  updateInfo();
+};
+$("fileClear").onclick = () => {
+  file = null;
+  $("fileChip").hidden = true;
+  $("msg").hidden = false;
+  updateInfo();
+};
+
+// Ask before anything that takes longer than WARN_SECONDS per pass.
+async function confirmLong() {
   const e = await getFrames();
-  if (!e) return;
-  const ac = audio();
-  await ac.resume();
-  const samples = Modem.synthesize(e.frames, ac.sampleRate, e.mode);
-  const buf = ac.createBuffer(1, samples.length, ac.sampleRate);
-  buf.copyToChannel(samples, 0);
-  await new Promise((resolve) => {
-    current = ac.createBufferSource();
-    current.buffer = buf;
-    current.connect(ac.destination);
-    current.onended = resolve;
-    current.start();
-  });
+  if (!e) return null;
+  const secs = Modem.duration(e.frames, e.mode);
+  if (secs <= WARN_SECONDS) return e;
+  const faster = e.mode !== "turbo" ? " Turbo would be ~3.5× faster if the devices are close." : "";
+  return confirm(`This takes about ${fmtDur(secs)} per pass (${e.frames.length} chunks).${faster}\n\nKeep both devices still and quiet the whole time. Send anyway?`) ? e : null;
 }
 
-$("play").onclick = () => { stopLoop(); playOnce().catch(showError); };
-$("loop").onclick = async () => {
-  if (looping) return stopLoop();
-  looping = true;
-  $("loop").textContent = "Stop";
-  try {
-    while (looping) {
-      await playOnce();
-      await new Promise((r) => setTimeout(r, 600));
+// Plays one pass, synthesizing and scheduling a few seconds ahead so long files never build one huge buffer.
+function playPass(e) {
+  const ac = audio();
+  const sources = new Set();
+  let stopped = false, resolveDone;
+  const done = new Promise((r) => (resolveDone = r));
+  sending = {
+    stop() {
+      stopped = true;
+      sources.forEach((s) => { try { s.stop(); } catch {} });
+      resolveDone();
+    },
+  };
+  const bar = $("sendProgress");
+  bar.max = e.frames.length;
+  bar.value = 0;
+  bar.hidden = e.frames.length < 2;
+  (async () => {
+    await ac.resume();
+    let t = ac.currentTime + 0.1;
+    let playedUntil = t;
+    for (let i = 0; i < e.frames.length && !stopped; i++) {
+      while (!stopped && t - ac.currentTime > 3) await new Promise((r) => setTimeout(r, 200));
+      if (stopped) break;
+      const samples = Modem.synthesize([e.frames[i]], ac.sampleRate, e.mode);
+      const buf = ac.createBuffer(1, samples.length, ac.sampleRate);
+      buf.copyToChannel(samples, 0);
+      const src = ac.createBufferSource();
+      src.buffer = buf;
+      src.connect(ac.destination);
+      src.onended = () => {
+        sources.delete(src);
+        bar.value = i + 1;
+        const left = Math.max(0, playedUntil - ac.currentTime);
+        if (e.frames.length > 1) $("sendInfo").textContent = `Sending ${i + 1}/${e.frames.length} · ${fmtDur(left)} left`;
+      };
+      sources.add(src);
+      src.start(t);
+      t += buf.duration;
+      playedUntil = t;
     }
-  } catch (e) { showError(e); stopLoop(); }
-};
-function stopLoop() {
-  looping = false;
-  $("loop").textContent = "Loop";
-  try { current?.stop(); } catch {}
+    while (!stopped && ac.currentTime < playedUntil) await new Promise((r) => setTimeout(r, 100));
+    resolveDone();
+  })().catch((err) => { showError(err); resolveDone(); });
+  return done;
 }
+
+function stopSending() {
+  looping = false;
+  sending?.stop();
+  sending = null;
+  $("loop").textContent = "Loop";
+  $("sendProgress").hidden = true;
+  updateInfo();
+}
+
+$("play").onclick = async () => {
+  audio().resume(); // inside the tap, before any await, so iOS lets audio start
+  stopSending();
+  try {
+    const e = await confirmLong();
+    if (!e) return;
+    await playPass(e);
+    stopSending();
+  } catch (err) { showError(err); }
+};
+$("loop").onclick = async () => {
+  if (looping) return stopSending();
+  audio().resume();
+  stopSending();
+  try {
+    const e = await confirmLong();
+    if (!e) return;
+    looping = true;
+    $("loop").textContent = "Stop";
+    while (looping) {
+      await playPass(e);
+      if (looping) await new Promise((r) => setTimeout(r, 600));
+    }
+  } catch (err) { showError(err); stopSending(); }
+};
 
 // ---------- Receive ----------
 let stream, proc, analyser, worker, raf;
@@ -131,23 +232,26 @@ const pending = new Map(); // multi-chunk key -> progress <li>
 for (let i = 0; i < 17; i++) $("bars").appendChild(document.createElement("div"));
 
 const receiver = new Modem.Receiver({
-  onMessage({ key, text }) {
+  onMessage({ key, text, file }) {
     const now = Date.now(), last = seen.get(key);
     seen.set(key, now);
-    pending.get(key)?.remove();
+    pending.get(key)?.li.remove();
     pending.delete(key);
     if (last && now - last < 15000) return;
-    addMessage(text);
+    file ? addFile(file) : addMessage(text);
   },
   onProgress({ key, got, total }) {
-    let li = pending.get(key);
-    if (!li) {
-      li = document.createElement("li");
+    let p = pending.get(key);
+    if (!p) {
+      const li = document.createElement("li");
       li.innerHTML = `<div class="meta"><span></span></div><progress></progress>`;
       $("log").prepend(li);
-      pending.set(key, li);
+      pending.set(key, (p = { li, first: Date.now(), firstGot: got }));
     }
-    li.querySelector("span").textContent = `Receiving… ${got}/${total} chunks`;
+    const li = p.li;
+    const rate = (got - p.firstGot) / ((Date.now() - p.first) / 1000); // chunks per second
+    const eta = got - p.firstGot >= 3 && rate > 0 ? ` · ~${fmtDur((total - got) / rate)} left` : "";
+    li.querySelector("span").textContent = `Receiving… ${got}/${total} chunks${eta}`;
     li.querySelector("progress").max = total;
     li.querySelector("progress").value = got;
   },
@@ -238,6 +342,25 @@ function addMessage(text) {
     a.textContent = text.startsWith("http") ? "Open" : "Open gist";
     meta.append(a);
   }
+  li.append(code, meta);
+  $("log").prepend(li);
+  navigator.vibrate?.(80);
+}
+
+function addFile({ name, bytes }) {
+  const li = document.createElement("li");
+  li.className = "new";
+  const code = document.createElement("code");
+  code.textContent = `📄 ${name}`;
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const size = document.createElement("span");
+  size.textContent = `${new Date().toLocaleTimeString()} · ${fmtBytes(bytes.length)}`;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([bytes]));
+  a.download = name;
+  a.textContent = "Download";
+  meta.append(size, a);
   li.append(code, meta);
   $("log").prepend(li);
   navigator.vibrate?.(80);
