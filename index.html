@@ -35,13 +35,18 @@
   #log a, #log button { font-size: 13px; padding: 2px 8px; }
   progress { width: 100%; height: 6px; }
   .new { animation: flash 1.2s; }
+  #rxPanel { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+  #rxPanel .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  #rxPanel strong { font-size: 18px; }
+  #chunkMap { display: block; width: 100%; height: 18px; margin: 8px 0 6px; border-radius: 3px; }
+  #heard { margin-top: 8px; }
   @keyframes flash { from { background: color-mix(in srgb, var(--ok) 25%, transparent); } }
 </style>
 </head>
 <body>
 <main>
   <h1>Chirp — data over sound</h1>
-  <nav style="font-size:14px;margin:-8px 0 16px"><b>Sound</b> · <a href="camera.html" style="color:var(--accent)">Camera (files, Mbps)</a></nav>
+  <nav style="font-size:14px;margin:-8px 0 16px"><b>Sound</b> · <a href="camera/" style="color:var(--accent)">Camera (files, ~1–2 Mbps)</a></nav>
 
   <section>
     <h2>Send</h2>
@@ -64,12 +69,18 @@
       <span id="rxStatus" class="hint">Mic off</span>
     </div>
     <div id="bars"></div>
+    <div id="heard" class="hint"></div>
+    <div id="rxPanel" hidden>
+      <div class="top"><strong id="rxPct"></strong><span id="rxEta" class="hint"></span></div>
+      <canvas id="chunkMap"></canvas>
+      <div id="rxDetail" class="hint"></div>
+    </div>
     <ul id="log"></ul>
   </section>
 
   <p class="hint">Turbo is ~3.5× faster but wants the devices close (≤30 cm) and a quiet room; fall back to Fast or Robust if it doesn't land.
     Long text and files are compressed and split into chunks — use Loop and the receiver fills in any chunk it missed. Receiver auto-detects the speed.
-    Rough capacity in 3 minutes: ~7 KB on Turbo, ~2 KB on Fast (more if the file compresses well). A 600 KB file is roughly 4–5 hours on Turbo.</p>
+    Rough capacity in 3 minutes: ~7 KB on Turbo, ~2 KB on Fast (more if the file compresses well). A 600 KB file is roughly 4–5 hours on Turbo — use <a href="camera/" style="color:var(--accent)">Camera</a> for files.</p>
 </main>
 
 <script src="modem.js"></script>
@@ -108,7 +119,8 @@ async function updateInfo() {
     const e = await getFrames();
     if (!e) return (info.textContent = "");
     const secs = Modem.duration(e.frames, e.mode);
-    info.textContent = `${fmtDur(secs)}${e.frames.length > 1 ? ` · ${e.frames.length} chunks` : ""}${secs > WARN_SECONDS ? " · over 3 min" : ""}`;
+    info.textContent = `${fmtDur(secs)}${e.frames.length > 1 ? ` per pass · ${e.frames.length} chunks` : ""}${secs > WARN_SECONDS ? " · over 3 min" : ""}`;
+    if (file && secs > 20) info.textContent += " · Camera mode would take about a second";
     if (secs > WARN_SECONDS) info.className = "hint warn";
   } catch (err) {
     info.textContent = err.message;
@@ -147,7 +159,7 @@ async function confirmLong() {
 }
 
 // Plays one pass, synthesizing and scheduling a few seconds ahead so long files never build one huge buffer.
-function playPass(e) {
+function playPass(e, pass = 1) {
   const ac = audio();
   const sources = new Set();
   let stopped = false, resolveDone;
@@ -167,6 +179,7 @@ function playPass(e) {
     await ac.resume();
     let t = ac.currentTime + 0.1;
     let playedUntil = t;
+    const passEnd = t + Modem.duration(e.frames, e.mode); // whole pass, not just what is scheduled so far
     for (let i = 0; i < e.frames.length && !stopped; i++) {
       while (!stopped && t - ac.currentTime > 3) await new Promise((r) => setTimeout(r, 200));
       if (stopped) break;
@@ -179,8 +192,8 @@ function playPass(e) {
       src.onended = () => {
         sources.delete(src);
         bar.value = i + 1;
-        const left = Math.max(0, playedUntil - ac.currentTime);
-        if (e.frames.length > 1) $("sendInfo").textContent = `Sending ${i + 1}/${e.frames.length} · ${fmtDur(left)} left`;
+        const left = Math.max(0, passEnd - ac.currentTime);
+        if (e.frames.length > 1) $("sendInfo").textContent = `${pass > 1 ? `Pass ${pass} · ` : ""}Sent ${i + 1}/${e.frames.length} · ${fmtDur(left)} left in this pass`;
       };
       sources.add(src);
       src.start(t);
@@ -223,8 +236,8 @@ $("loop").onclick = async () => {
     if (!e) return;
     looping = true;
     $("loop").textContent = "Stop";
-    while (looping) {
-      await playPass(e);
+    for (let pass = 1; looping; pass++) {
+      await playPass(e, pass);
       if (looping) await new Promise((r) => setTimeout(r, 600));
     }
   } catch (err) { showError(err); stopSending(); }
@@ -233,33 +246,93 @@ $("loop").onclick = async () => {
 // ---------- Receive ----------
 let stream, proc, analyser, worker, raf;
 const seen = new Map(); // message key -> last time shown, so loops don't spam the list
-const pending = new Map(); // multi-chunk key -> progress <li>
+let active = null; // the multi-chunk transfer being shown in #rxPanel
+const heard = { clean: 0, damaged: 0, mode: null, last: 0 };
 
 for (let i = 0; i < 17; i++) $("bars").appendChild(document.createElement("div"));
+
+// Every frame the decoders lock onto, clean or not, so a failing transfer still shows signs of life.
+function onHeard({ ok, score, mode }) {
+  if (score < 0.65) return; // cross-mode ghosts score ~0.52; real frames 0.8+
+  ok ? heard.clean++ : heard.damaged++;
+  heard.mode = mode;
+  heard.last = Date.now();
+  renderHeard();
+}
+function renderHeard() {
+  const el = $("heard");
+  if (!stream) return (el.textContent = "");
+  if (!heard.clean && !heard.damaged) return (el.textContent = "Not hearing Chirp tones yet — bring the devices closer and turn the volume up.");
+  const fresh = Date.now() - heard.last < 4000;
+  const label = Modem.MODES[heard.mode].label;
+  el.textContent = `${fresh ? `Hearing ${label}` : "Quiet"} · ${heard.clean} clean, ${heard.damaged} damaged frames`;
+  el.className = heard.damaged > heard.clean ? "hint warn" : "hint";
+  if (fresh && heard.damaged > heard.clean && heard.damaged >= 3)
+    el.textContent += ` — most chunks arrive damaged: move closer${heard.mode === "turbo" ? " or switch the sender to Fast" : ""}`;
+}
+setInterval(renderHeard, 1000);
+
+// Where the sender is in its pass tells us when each missing chunk comes round again.
+function etaSeconds(a) {
+  const chunk = Modem.chunkSeconds(a.mode);
+  let worst = 0;
+  for (let m = 0; m < a.total; m++) {
+    if (a.have.has(m)) continue;
+    const d = (m - a.lastIdx + a.total) % a.total;
+    worst = Math.max(worst, d * chunk + (m < a.lastIdx ? 0.7 : 0)); // 0.7 s pause between Loop passes
+  }
+  return Math.max(0, worst - (Date.now() - a.lastAt) / 1000);
+}
+
+function renderActive() {
+  const a = active;
+  if (!a) return;
+  $("rxPanel").hidden = false;
+  const pct = Math.floor((100 * a.have.size) / a.total);
+  $("rxPct").textContent = a.done ? "Received ✓" : `${pct}% · ${a.have.size}/${a.total} chunks`;
+  if (a.done) {
+    $("rxEta").textContent = `${fmtDur((a.doneAt - a.first) / 1000)} total`;
+    $("rxDetail").textContent = `${Modem.MODES[a.mode].label} · ${a.total} chunks${a.misses ? ` · ${a.misses} recovered on a later pass` : ""}`;
+  } else {
+    const eta = etaSeconds(a), pass = a.total * Modem.chunkSeconds(a.mode);
+    $("rxEta").textContent = `~${fmtDur(eta)} left${a.misses ? " if the next pass lands" : ""}`;
+    $("rxDetail").textContent = `${Modem.MODES[a.mode].label} · ${fmtDur(pass)} per pass · ${a.misses ? `${a.misses} chunk${a.misses > 1 ? "s" : ""} missed so far, Loop fills them in` : "no misses so far"}`;
+  }
+  const c = $("chunkMap"), dpr = devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr;
+  c.height = c.clientHeight * dpr;
+  const g = c.getContext("2d"), css = getComputedStyle(document.documentElement);
+  const w = c.width / a.total;
+  g.fillStyle = css.getPropertyValue("--line");
+  g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = css.getPropertyValue("--ok");
+  for (const i of a.have.keys()) g.fillRect(Math.floor(i * w), 0, Math.ceil(w), c.height);
+  if (!a.done) {
+    g.fillStyle = css.getPropertyValue("--accent");
+    g.fillRect(Math.floor(a.lastIdx * w), 0, Math.max(2, Math.ceil(w)), c.height);
+  }
+}
+setInterval(() => active && !active.done && renderActive(), 1000);
 
 const receiver = new Modem.Receiver({
   onMessage({ key, text, file }) {
     const now = Date.now(), last = seen.get(key);
     seen.set(key, now);
-    pending.get(key)?.li.remove();
-    pending.delete(key);
+    if (active?.key === key && !active.done) {
+      active.done = true;
+      active.doneAt = now;
+      renderActive();
+    }
     if (last && now - last < 15000) return;
     file ? addFile(file) : addMessage(text);
   },
-  onProgress({ key, got, total }) {
-    let p = pending.get(key);
-    if (!p) {
-      const li = document.createElement("li");
-      li.innerHTML = `<div class="meta"><span></span></div><progress></progress>`;
-      $("log").prepend(li);
-      pending.set(key, (p = { li, first: Date.now(), firstGot: got }));
-    }
-    const li = p.li;
-    const rate = (got - p.firstGot) / ((Date.now() - p.first) / 1000); // chunks per second
-    const eta = got - p.firstGot >= 3 && rate > 0 ? ` · ~${fmtDur((total - got) / rate)} left` : "";
-    li.querySelector("span").textContent = `Receiving… ${got}/${total} chunks${eta}`;
-    li.querySelector("progress").max = total;
-    li.querySelector("progress").value = got;
+  onProgress({ key, got, total, idx, mode, have }) {
+    if (active?.key !== key) active = { key, total, mode, have, first: Date.now(), misses: 0, lastIdx: idx };
+    // Chunks skipped between this one and the previous one were played but not decoded.
+    const a = active;
+    for (let m = (a.lastIdx + 1) % total; m !== idx && got > 1; m = (m + 1) % total) if (!have.has(m)) a.misses++;
+    Object.assign(a, { have, mode, lastIdx: idx, lastAt: Date.now() });
+    renderActive();
   },
   onError: showError,
 });
@@ -278,7 +351,7 @@ $("listen").onclick = async () => {
 
   worker = new Worker("worker.js");
   worker.postMessage({ sampleRate: ac.sampleRate });
-  worker.onmessage = ({ data }) => receiver.push(data);
+  worker.onmessage = ({ data }) => (data.debug ? onHeard(data) : receiver.push(data));
   worker.onerror = (e) => showError(e.message);
 
   const src = ac.createMediaStreamSource(stream);
@@ -298,6 +371,8 @@ $("listen").onclick = async () => {
 
   $("listen").textContent = "Stop";
   $("rxStatus").textContent = `Listening · ${ac.sampleRate} Hz`;
+  Object.assign(heard, { clean: 0, damaged: 0, mode: null, last: 0 });
+  renderHeard();
 };
 
 function stopListening() {
@@ -310,6 +385,7 @@ function stopListening() {
   setSession("auto");
   $("listen").textContent = "Listen";
   $("rxStatus").textContent = "Mic off";
+  renderHeard();
 }
 
 function drawBars(sr) {

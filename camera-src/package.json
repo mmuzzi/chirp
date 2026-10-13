@@ -1,0 +1,27 @@
+{
+  "name": "chirp-camera",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@raptorqr/core": "0.1.1",
+    "@raptorqr/fast-qr-wasm": "0.1.1",
+    "@raptorqr/raptorq-wasm": "0.1.1",
+    "brotli-wasm": "3.0.1",
+    "fflate": "^0.8.3",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "zxing-wasm": "3.1.2"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "typescript": "5.9.3",
+    "vite": "8.0.13"
+  }
+}

@@ -129,8 +129,12 @@
   }
 
   const GAP_SEC = 0.05;
-  const duration = (frames, modeName) =>
-    GAP_SEC * (frames.length + 1) + frames.reduce((a, f) => a + f.length, 0) * MODES[modeName].sym;
+  // Airtime of one synthesize([frame]) buffer (leading + trailing gap), which is how the sender plays them.
+  const frameSeconds = (symbols, modeName) => 2 * GAP_SEC + symbols * MODES[modeName].sym;
+  const duration = (frames, modeName) => frames.reduce((a, f) => a + frameSeconds(f.length, modeName), 0);
+  // Airtime of one full chunk of a multi-frame message: head + id/idx/total + len + payload + CRC.
+  const chunkSeconds = (modeName) =>
+    frameSeconds(PREAMBLE.length + Math.ceil((14 + CHUNK_NIBBLES + 4) / MODES[modeName].channels), modeName);
 
   function synthesize(frames, sampleRate, modeName) {
     const mode = MODES[modeName];
@@ -349,7 +353,7 @@
   }
 
   // Collects frames from any decoder and reassembles multi-frame messages.
-  // onProgress({ key, got, total }) while assembling; onMessage({ key, text } or { key, file }) when a message completes.
+  // onProgress({ key, got, total, idx, mode, have }) while assembling (have: Map of received chunk indices); onMessage({ key, text } or { key, file }) when a message completes.
   class Receiver {
     constructor({ onMessage, onProgress, onError }) {
       this.partial = new Map();
@@ -365,7 +369,7 @@
       if (!p) this.partial.set(key, (p = { chunks: new Map(), total: frame.total, done: false }));
       if (p.done || p.chunks.has(frame.idx) || frame.idx >= frame.total) return;
       p.chunks.set(frame.idx, frame.nibbles);
-      this.onProgress({ key, got: p.chunks.size, total: p.total });
+      this.onProgress({ key, got: p.chunks.size, total: p.total, idx: frame.idx, mode: frame.mode, have: p.chunks });
       if (p.chunks.size < p.total) return;
       p.done = true;
       const nibbles = Array.from({ length: p.total }, (_, i) => p.chunks.get(i)).flat();
@@ -387,7 +391,7 @@
     }
   }
 
-  const api = { MODES, tonesOf, crc16, crc32, packMessage, unpackMessage, encode, duration, synthesize, Decoder, Receiver };
+  const api = { MODES, tonesOf, crc16, crc32, packMessage, unpackMessage, encode, duration, frameSeconds, chunkSeconds, synthesize, Decoder, Receiver };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.Modem = api;
 })(typeof self !== "undefined" ? self : this);

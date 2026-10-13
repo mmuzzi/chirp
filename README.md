@@ -10,19 +10,18 @@ Send short text or small files between devices over sound: open the page on both
 
 Mic access needs HTTPS (or localhost). Run `node test.js` for the offline channel simulation.
 
-## Camera mode (`camera.html`)
+## Camera mode (`camera/`)
 
-Screen-to-camera file transfer aimed at the realistic ceiling for a 120 Hz laptop and a phone camera in a browser:
-a custom black/white cell grid (not QR) with 9 markers + 14 alignment dots, Reed-Solomon (255,223) per row-band
-packet so half-blended frames still yield their clean rows, and RaptorQ (vendored wasm, MIT) as the fountain code.
-The receiver samples cells on the GPU (WebGL) and fits a homography + cubic lens correction.
+Screen-to-camera file transfer, ported from Talaria: an animated stream of raw-byte QR codes (fast_qr wasm) carrying
+RaptorQ fountain symbols, scanned with ZXing-C++ wasm in a Web Worker. Open `camera/#send` on the screen with the file
+and `camera/#scan` on the phone. The receiver shows progress, live rate and ETA, and verifies every checksum before Save.
 
-| Preset | Cells | Raw rate @ 60 screens/s | Simulated (720p / 1080p camera) |
-|---|---|---|---|
-| Safe | 256×144 | 1.5 Mbps | — |
-| Fast | 320×180 | 2.5 Mbps | 2.5 / — |
-| Max | 384×216 | 3.8 Mbps | 3.45 / 3.7 |
-| Ultra | 480×270 | 6.0 Mbps | — / 5.9 |
+- **Fast · dual lane** (default): two V40-L codes side by side, 120 symbols/s on screen (2.8 Mbps); a phone camera at
+  30–60 fps catches ~1.1–2 Mbps. Pick "Fast dual" on the receiver.
+- **Fallback · single lane**: one V30-L code at 30 fps (0.4 Mbps), more forgiving.
 
-`node sim/optical-sim.mjs <preset> <camHeight> <fileKB> [--harsh 1] [--y4m out.y4m]` runs the physical channel model
-(display scan-out, LCD response, rolling shutter, exposure, blur, distortion, shake, noise) through the real decoder.
+Source lives in `camera-src/` (React + TypeScript, Vite); `camera/` is the committed build for GitHub Pages:
+
+```bash
+cd camera-src && npm install && npm run build   # typecheck + build into ../camera
+```
